@@ -1,0 +1,4 @@
+item_id,demand_frequency,dimensions,current_stock,weight_per_unit
+BATCH1,55,0.2x0.3x0.4,40,1.1
+BATCH2,15,0.1x0.2x0.2,25,0.8
+BATCH3,140,0.3x0.3x0.5,60,1.0
