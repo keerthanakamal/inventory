@@ -27,9 +27,9 @@ PACKING STATION:
   - Distances for ranking shelves calculated via Euclidean distance to (0,0).
 
 OUTPUT:
-  - placement_recommendations.csv with columns:
-        item_id, recommended_location
-    If an item cannot be placed under constraints, recommended_location will be 'UNPLACED'.
+    - placement_recommendations.csv with columns (multi-item aware):
+                item_id, recommended_location, allocated_volume, allocated_weight, remaining_size, remaining_weight
+        Backward compatibility: if old file exists with only first two columns it will be extended going forward.
 
 USAGE:
   Basic:
@@ -200,24 +200,91 @@ def load_locations(path: str) -> List[LocationRecord]:
     return locations
 
 
-def greedy_assign(items: List[ItemRecord], locations: List[LocationRecord]) -> pd.DataFrame:
+def _initialize_capacity_df(existing_path: str) -> pd.DataFrame:
+    """Load existing placement file (if any) returning DataFrame with required columns.
+    Older versions may only have item_id,recommended_location.
+    """
+    if not os.path.exists(existing_path):
+        return pd.DataFrame(columns=[
+            "item_id", "recommended_location", "allocated_volume", "allocated_weight", "remaining_size", "remaining_weight"
+        ])
+    df = pd.read_csv(existing_path)
+    # Add missing columns with NaNs; we'll recompute residuals from scratch.
+    for col in ["allocated_volume", "allocated_weight", "remaining_size", "remaining_weight"]:
+        if col not in df.columns:
+            df[col] = None
+    return df
+
+
+def greedy_assign(items: List[ItemRecord], locations: List[LocationRecord], existing_path: str) -> pd.DataFrame:
+    """Multi-item greedy assign with residual capacity.
+    Each location can host multiple items until size or weight exceeded.
+    Residual capacities tracked in output rows.
+    """
+    existing_df = _initialize_capacity_df(existing_path)
+    # Build capacity map: location_id -> remaining size/weight
+    cap_map = {loc.location_id: {"remaining_size": loc.max_size, "remaining_weight": loc.max_weight} for loc in locations}
+    # Subtract already allocated items (recompute from existing rows where placement valid)
+    if not existing_df.empty:
+        # We don't trust stored residuals (could be absent); recompute from allocations
+        merged = existing_df.merge(
+            pd.DataFrame([{ 'location_id': l.location_id, 'max_size': l.max_size, 'max_weight': l.max_weight } for l in locations]),
+            left_on="recommended_location", right_on="location_id", how="left"
+        )
+        for _, row in merged.iterrows():
+            loc_id = row.get("recommended_location")
+            if not isinstance(loc_id, str) or loc_id == "UNPLACED" or loc_id not in cap_map:
+                continue
+            allocated_volume = row.get("allocated_volume")
+            allocated_weight = row.get("allocated_weight")
+            # Fallback: if missing allocated values, try to infer from item_id via provided volume approximations not stored -> skip
+            if pd.isna(allocated_volume) or pd.isna(allocated_weight):
+                # Cannot reliably subtract; skip to avoid negatives
+                continue
+            cap_map[loc_id]["remaining_size"] -= float(allocated_volume)
+            cap_map[loc_id]["remaining_weight"] -= float(allocated_weight)
+            # Clamp at zero
+            cap_map[loc_id]["remaining_size"] = max(0.0, cap_map[loc_id]["remaining_size"])
+            cap_map[loc_id]["remaining_weight"] = max(0.0, cap_map[loc_id]["remaining_weight"])
+
     placement_rows = []
     for item in items:
-        assigned_location = None
-        # Skip early if obviously invalid volume
+        chosen = None
         if item.volume <= 0:
-            placement_rows.append({"item_id": item.item_id, "recommended_location": "UNPLACED"})
+            placement_rows.append({
+                "item_id": item.item_id,
+                "recommended_location": "UNPLACED",
+                "allocated_volume": 0.0,
+                "allocated_weight": 0.0,
+                "remaining_size": None,
+                "remaining_weight": None,
+            })
             continue
         for loc in locations:
-            if loc.occupied:
-                continue
-            if item.volume <= loc.max_size and item.total_weight <= loc.max_weight:
-                assigned_location = loc.location_id
-                loc.occupied = True
+            cap = cap_map[loc.location_id]
+            if item.volume <= cap["remaining_size"] and item.total_weight <= cap["remaining_weight"]:
+                # Assign here
+                cap["remaining_size"] -= item.volume
+                cap["remaining_weight"] -= item.total_weight
+                chosen = loc.location_id
+                placement_rows.append({
+                    "item_id": item.item_id,
+                    "recommended_location": chosen,
+                    "allocated_volume": item.volume,
+                    "allocated_weight": item.total_weight,
+                    "remaining_size": cap["remaining_size"],
+                    "remaining_weight": cap["remaining_weight"],
+                })
                 break
-        if not assigned_location:
-            assigned_location = "UNPLACED"
-        placement_rows.append({"item_id": item.item_id, "recommended_location": assigned_location})
+        if not chosen:
+            placement_rows.append({
+                "item_id": item.item_id,
+                "recommended_location": "UNPLACED",
+                "allocated_volume": 0.0,
+                "allocated_weight": 0.0,
+                "remaining_size": None,
+                "remaining_weight": None,
+            })
     return pd.DataFrame(placement_rows)
 
 
@@ -235,8 +302,14 @@ def run(items_path: str, layout_path: str, output_path: str) -> str:
         LOGGER.warning("No locations available. All items will be UNPLACED.")
 
     LOGGER.info("Running greedy assignment...")
-    df_result = greedy_assign(items, locations)
-    df_result.to_csv(output_path, index=False)
+    df_result = greedy_assign(items, locations, output_path)
+    # If existing file exists, append new rows (multi-item incremental). Else write new.
+    if os.path.exists(output_path):
+        existing = _initialize_capacity_df(output_path)
+        combined = pd.concat([existing, df_result], ignore_index=True)
+        combined.to_csv(output_path, index=False)
+    else:
+        df_result.to_csv(output_path, index=False)
     LOGGER.info("Placement recommendations written to %s", output_path)
     return output_path
 

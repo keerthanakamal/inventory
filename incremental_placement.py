@@ -48,8 +48,9 @@ from __future__ import annotations
 import math
 import os
 import pickle
+import json
 import argparse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -59,14 +60,20 @@ PLACEMENTS_FILE = "placement_recommendations.csv"
 LAYOUT_CANDIDATE_FILENAMES = ["warehouse_layout.csv", "locations_data.csv", "locations_data_extended.csv"]  # extended file added
 
 # RL Hyperparameters
-ALPHA = 0.3            # learning rate
-EPSILON = 0.15         # exploration probability
-N_EPISODES = 40        # episodes per new item (small to stay fast)
+ALPHA = 0.3             # learning rate
+N_EPISODES = 40         # episodes per new item (small to stay fast)
 DEMAND_BUCKET_SIZE = 25  # bucket width for demand frequency
-DEMAND_WEIGHT = 0.1     # weight coefficient for demand in reward
+DEMAND_WEIGHT = 0.1      # weight coefficient for demand in reward
+
+# Epsilon (exploration) dynamic decay
+EPSILON_START = 0.25
+EPSILON_MIN = 0.05
+EPSILON_DECAY = 0.995   # multiplicative per update step
+
+META_PATH = "rl_meta.json"  # stores {steps, epsilon}
 
 
-def _load_q_table() -> Dict[Tuple[int, str], float]:
+def _load_q_table() -> Dict[Any, float]:
     if os.path.exists(Q_TABLE_PATH):
         try:
             with open(Q_TABLE_PATH, "rb") as f:
@@ -74,6 +81,29 @@ def _load_q_table() -> Dict[Tuple[int, str], float]:
         except Exception:
             return {}
     return {}
+
+
+def _load_meta() -> Dict[str, Any]:
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "steps" not in data:
+                data["steps"] = 0
+            if "epsilon" not in data:
+                data["epsilon"] = EPSILON_START
+            return data
+        except Exception:
+            pass
+    return {"steps": 0, "epsilon": EPSILON_START}
+
+
+def _save_meta(meta: Dict[str, Any]) -> None:
+    try:
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
 
 
 def _save_q_table(q: Dict[Tuple[int, str], float]):
@@ -127,24 +157,53 @@ def _load_layout(layout_override: Optional[str] = None) -> pd.DataFrame:
 
 def _load_existing_placements() -> pd.DataFrame:
     if os.path.exists(PLACEMENTS_FILE):
-        return pd.read_csv(PLACEMENTS_FILE)
-    return pd.DataFrame(columns=["item_id", "recommended_location"])
+        df = pd.read_csv(PLACEMENTS_FILE)
+        # Ensure extended columns exist
+        for col in ["allocated_volume", "allocated_weight", "remaining_size", "remaining_weight"]:
+            if col not in df.columns:
+                df[col] = None
+        # If file originally only had two columns, we keep rows but treat them as historical placements without capacity deduction
+        # Future placements will populate new columns; residuals derived only from rows with allocated_* present.
+        return df
+    return pd.DataFrame(columns=["item_id", "recommended_location", "allocated_volume", "allocated_weight", "remaining_size", "remaining_weight"])
 
 
 def _get_available_shelves(layout_df: pd.DataFrame, placements_df: pd.DataFrame) -> pd.DataFrame:
-    occupied = set(placements_df["recommended_location"].dropna().tolist())
-    # If an is_shelf column exists, keep only True
+    # Start with all shelves (filter packing, etc.)
     df = layout_df.copy()
     if "is_shelf" in df.columns:
         df = df[df["is_shelf"] == True]  # noqa: E712
-    # Remove packing station heuristically (at origin or id contains 'packing')
     df = df[~df["location_id"].str.lower().str.contains("packing")]
     df = df[(df["x_coord"] != 0) | (df["y_coord"] != 0)]
-    return df[~df["location_id"].isin(occupied)].copy()
+
+    # Aggregate existing allocations to compute residuals
+    if not placements_df.empty:
+        agg = placements_df[placements_df["recommended_location"].notna() & (placements_df["recommended_location"] != "UNPLACED")]
+        if not agg.empty:
+            grouped = agg.groupby("recommended_location").agg({
+                "allocated_volume": "sum",
+                "allocated_weight": "sum"
+            }).rename(columns={"allocated_volume": "used_volume", "allocated_weight": "used_weight"})
+            df = df.merge(grouped, left_on="location_id", right_index=True, how="left")
+            # Avoid chained assignment FutureWarning by assigning the result of fillna
+            df["used_volume"] = df["used_volume"].fillna(0.0)
+            df["used_weight"] = df["used_weight"].fillna(0.0)
+            df["remaining_size"] = (df["max_size"] - df["used_volume"]).clip(lower=0)
+            df["remaining_weight"] = (df["max_weight"] - df["used_weight"]).clip(lower=0)
+        else:
+            df["remaining_size"] = df["max_size"]
+            df["remaining_weight"] = df["max_weight"]
+    else:
+        df["remaining_size"] = df["max_size"]
+        df["remaining_weight"] = df["max_weight"]
+    return df
 
 
 def _feasible_shelves(available_df: pd.DataFrame, volume: float, total_weight: float) -> pd.DataFrame:
-    return available_df[(volume <= available_df["max_size"]) & (total_weight <= available_df["max_weight"])]
+    # Use remaining capacity columns if present, else full capacity
+    size_col = "remaining_size" if "remaining_size" in available_df.columns else "max_size"
+    weight_col = "remaining_weight" if "remaining_weight" in available_df.columns else "max_weight"
+    return available_df[(volume <= available_df[size_col]) & (total_weight <= available_df[weight_col])]
 
 
 def _compute_distances(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,7 +216,7 @@ def _demand_bucket(demand: float) -> int:
     return int(demand // DEMAND_BUCKET_SIZE)
 
 
-def _epsilon_greedy_select(q_table: Dict[Tuple[int, str], float], demand_bucket: int, shelves: List[str], epsilon: float) -> str:
+def _epsilon_greedy_select(q_table: Dict[Any, float], state_key_partial: Tuple[int, int, int], shelves: List[str], epsilon: float) -> str:
     if not shelves:
         raise ValueError("No shelves provided to epsilon-greedy selection")
     if np.random.rand() < epsilon:
@@ -166,20 +225,47 @@ def _epsilon_greedy_select(q_table: Dict[Tuple[int, str], float], demand_bucket:
     best_shelf = None
     best_q = -float("inf")
     for sid in shelves:
-        q = q_table.get((demand_bucket, sid), 0.0)
+        full_key = (*state_key_partial, sid)
+        # Backward compatibility: if not present, fall back to legacy (demand_bucket, sid)
+        legacy_key = (state_key_partial[0], sid)
+        q = q_table.get(full_key, q_table.get(legacy_key, 0.0))
         if q > best_q:
             best_q = q
             best_shelf = sid
     return best_shelf if best_shelf is not None else np.random.choice(shelves)
 
 
-def _reward(distance: float, max_distance: float, demand_frequency: float) -> float:
+def _reward(distance: float, max_distance: float, demand_frequency: float, *, volume: float, shelf_capacity: float, remaining_before: float) -> float:
+    """Composite reward with distance, demand, and fit shaping.
+
+    Distance term: 1 - (d/max_d)
+    Demand term: demand / (demand + 10)
+    Fit shaping (encourages avoiding tiny leftover space or excessive leftover):
+        residual_after = remaining_before - volume
+        residual_ratio_after = residual_after / shelf_capacity
+        Target residual band: [0.25, 0.60] (score=1 inside band)
+        Penalize below 0.25 (fragmentation) and above 0.60 (under-use)
+    Weighted combination: distance + DEMAND_WEIGHT * demand + FIT_WEIGHT * fit
+    """
     if max_distance <= 0:
         norm_dist_component = 1.0
     else:
-        norm_dist_component = 1.0 - (distance / max_distance)  # closer -> larger positive
+        norm_dist_component = 1.0 - (distance / max_distance)
     demand_norm = demand_frequency / (demand_frequency + 10.0)
-    return norm_dist_component + DEMAND_WEIGHT * demand_norm
+    FIT_WEIGHT = 0.15
+    if shelf_capacity <= 0:
+        fit_score = 0.0
+    else:
+        residual_after = max(0.0, remaining_before - volume)
+        residual_ratio_after = residual_after / shelf_capacity
+        if 0.25 <= residual_ratio_after <= 0.60:
+            fit_score = 1.0
+        elif residual_ratio_after < 0.25:
+            fit_score = max(0.0, (residual_ratio_after / 0.25) * 0.6)
+        else:  # >0.60
+            over_span = min(1.0, residual_ratio_after)
+            fit_score = max(0.0, 1 - (over_span - 0.60) / 0.40)
+    return norm_dist_component + DEMAND_WEIGHT * demand_norm + FIT_WEIGHT * fit_score
 
 
 def place_new_item(new_item: dict) -> str:
@@ -219,30 +305,83 @@ def _place_new_item_core(new_item: dict, layout_override: Optional[str] = None) 
 
     # Compute distances & sort for rule-based baseline
     feasible_df = _compute_distances(feasible_df)
-    feasible_df.sort_values(by=["distance", "location_id"], inplace=True)
+    feasible_df = feasible_df.sort_values(by=["distance", "location_id"]).copy()
 
     # RL training (bandit per state bucket)
     q_table = _load_q_table()
-    bucket = _demand_bucket(demand_freq)
+    meta = _load_meta()
+    current_epsilon = float(meta.get("epsilon", EPSILON_START))
+    steps = int(meta.get("steps", 0))
+    demand_bucket = _demand_bucket(demand_freq)
+    # Space bucket (pre-placement remaining ratio coarse buckets 0-4)
+    def space_bucket(rem_ratio: float) -> int:
+        if rem_ratio >= 0.8: return 4
+        if rem_ratio >= 0.6: return 3
+        if rem_ratio >= 0.4: return 2
+        if rem_ratio >= 0.2: return 1
+        return 0
+    # Diversity bucket: count of prior distinct items already on shelf (from placements_df)
+    diversity_map = {}
+    if not placements_df.empty:
+        placed_hist = placements_df[placements_df["recommended_location"].notna() & (placements_df["recommended_location"] != "UNPLACED")]
+        if not placed_hist.empty:
+            diversity_map = placed_hist.groupby("recommended_location")["item_id"].nunique().to_dict()
     shelves = feasible_df["location_id"].tolist()
     max_distance = feasible_df["distance"].max()
 
     for _ in range(N_EPISODES):
-        action_shelf = _epsilon_greedy_select(q_table, bucket, shelves, EPSILON)
-        dist = float(feasible_df.loc[feasible_df.location_id == action_shelf, "distance"].iloc[0])
-        r = _reward(dist, max_distance, demand_freq)
-        key = (bucket, action_shelf)
-        old_q = q_table.get(key, 0.0)
+        # Use mean remaining ratio across feasible shelves just for bucket derivation per action
+        # Epsilon-greedy uses a partial state (demand_bucket, generic space bucket  ) -> we approximate with average remaining ratio of chosen shelf each iteration
+        # We compute state per chosen shelf after selection for update.
+        # For selection, we approximate using median remaining ratio to build a stable partial key.
+        median_remaining_ratio = 0.0
+        if "remaining_size" in feasible_df.columns:
+            cap_series = feasible_df.apply(lambda r: float(r.get("remaining_size", r.get("max_size", 0.0))) / float(r.get("max_size", 1.0)), axis=1)
+            if not cap_series.empty:
+                median_remaining_ratio = float(cap_series.median())
+        space_bucket_partial = space_bucket(median_remaining_ratio)
+        diversity_bucket_partial = 0  # partial key diversity ignored for selection; refined per shelf update
+        state_key_partial = (demand_bucket, space_bucket_partial, diversity_bucket_partial)
+        action_shelf = _epsilon_greedy_select(q_table, state_key_partial, shelves, current_epsilon)
+        row_sel = feasible_df.loc[feasible_df.location_id == action_shelf].iloc[0]
+        dist = float(row_sel["distance"])
+        shelf_capacity = float(row_sel.get("max_size", 0.0))
+        remaining_before = float(row_sel.get("remaining_size", shelf_capacity))
+        rem_ratio = remaining_before / shelf_capacity if shelf_capacity > 0 else 0.0
+        sp_bucket = space_bucket(rem_ratio)
+        div_count = diversity_map.get(action_shelf, 0)
+        if div_count >= 8:
+            diversity_bucket = 4
+        elif div_count >= 5:
+            diversity_bucket = 3
+        elif div_count >= 3:
+            diversity_bucket = 2
+        elif div_count >= 1:
+            diversity_bucket = 1
+        else:
+            diversity_bucket = 0
+        r = _reward(dist, max_distance, demand_freq, volume=volume, shelf_capacity=shelf_capacity, remaining_before=remaining_before)
+        full_key = (demand_bucket, sp_bucket, diversity_bucket, action_shelf)
+        legacy_key = (demand_bucket, action_shelf)
+        old_q = q_table.get(full_key, q_table.get(legacy_key, 0.0))
         new_q = (1 - ALPHA) * old_q + ALPHA * r
-        q_table[key] = new_q
+        q_table[full_key] = new_q
+        # Update exploration schedule
+        steps += 1
+        current_epsilon = max(EPSILON_MIN, current_epsilon * EPSILON_DECAY)
 
     # Choose best shelf based on learned Q values
     best_shelf = None
     best_q = -float("inf")
     for sid in shelves:
-        q = q_table.get((bucket, sid), 0.0)
-        if q > best_q:
-            best_q = q
+        # Evaluate best across enriched state variants; fall back to legacy if none
+        candidate_qs = [v for k, v in q_table.items() if isinstance(k, tuple) and len(k) == 4 and k[-1] == sid and k[0] == demand_bucket]
+        legacy_q = q_table.get((demand_bucket, sid), None)
+        if not candidate_qs and legacy_q is not None:
+            candidate_qs = [legacy_q]
+        q_val = max(candidate_qs) if candidate_qs else 0.0
+        if q_val > best_q:
+            best_q = q_val
             best_shelf = sid
 
     # Fallback if for some reason best_shelf is None
@@ -250,14 +389,45 @@ def _place_new_item_core(new_item: dict, layout_override: Optional[str] = None) 
         best_shelf = shelves[0]  # first feasible by distance
 
     # Persist placement
-    new_row = {"item_id": new_item["item_id"], "recommended_location": best_shelf}
+    # Update residuals after selecting shelf
+    # Recompute residual fields for chosen shelf (if dataset supports them)
+    allocated_volume = volume
+    allocated_weight = total_weight
+    remaining_size = None
+    remaining_weight = None
+    if "remaining_size" in feasible_df.columns:
+        row_sel = feasible_df[feasible_df.location_id == best_shelf].iloc[0]
+        size_col = "remaining_size" if "remaining_size" in row_sel else "max_size"
+        weight_col = "remaining_weight" if "remaining_weight" in row_sel else "max_weight"
+        remaining_size = float(row_sel[size_col]) - allocated_volume
+        remaining_weight = float(row_sel[weight_col]) - allocated_weight
+    new_row = {
+        "item_id": new_item["item_id"],
+        "recommended_location": best_shelf,
+        "allocated_volume": allocated_volume,
+        "allocated_weight": allocated_weight,
+        "remaining_size": remaining_size,
+        "remaining_weight": remaining_weight,
+    }
     placements_df = pd.concat([placements_df, pd.DataFrame([new_row])], ignore_index=True)
     placements_df.to_csv(PLACEMENTS_FILE, index=False)
 
     # Persist Q table
     _save_q_table(q_table)
+    meta["steps"] = steps
+    meta["epsilon"] = current_epsilon
+    _save_meta(meta)
 
-    return f"New item {new_item['item_id']} placed at location {best_shelf}"
+    # Append epsilon info if meta present for transparency during CLI usage
+    eps_info = ""
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            eps_info = f" (epsilon={m.get('epsilon'):.4f}, steps={m.get('steps')})"
+        except Exception:
+            pass
+    return f"New item {new_item['item_id']} placed at location {best_shelf}{eps_info}"
 
 
 def _interactive_prompt() -> dict:
