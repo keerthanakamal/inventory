@@ -1,0 +1,2 @@
+timestamp,rows,placed_rows,avg_distance,weighted_distance,unplaced_rate,avg_cube_utilization,fragmentation_rate,total_allocated_volume,capacity_ratio,free_effective_capacity_ratio,placements_with_capacity_cols_ratio
+2025-09-12T14:52:25.625102,60,60,15.012560749679752,10.71336273541075,0.0,0.02864750933802897,1.0,0.109,0.0005463659147869675,0.025468671679197995,0.06666666666666667
