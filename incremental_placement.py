@@ -149,6 +149,10 @@ def _feasible_shelves(available_df: pd.DataFrame, volume: float, total_weight: f
 
 def _compute_distances(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # For new priority: higher aisle (x_coord) is 'closer'.
+    # Assign 'priority' as x_coord (higher is better), then y_coord (higher is better)
+    df["priority"] = df["x_coord"] * 1000 + df["y_coord"]
+    # Still compute Euclidean distance for RL reward
     df["distance"] = np.sqrt(df["x_coord"] ** 2 + df["y_coord"] ** 2)
     return df
 
@@ -178,8 +182,17 @@ def _reward(distance: float, max_distance: float, demand_frequency: float) -> fl
         norm_dist_component = 1.0
     else:
         norm_dist_component = 1.0 - (distance / max_distance)  # closer -> larger positive
+def _reward(distance: float, max_distance: float, demand_frequency: float, aisle: str = None) -> float:
+    if max_distance <= 0:
+        norm_dist_component = 1.0
+    else:
+        norm_dist_component = 1.0 - (distance / max_distance)
     demand_norm = demand_frequency / (demand_frequency + 10.0)
-    return norm_dist_component + DEMAND_WEIGHT * demand_norm
+    base_reward = norm_dist_component + DEMAND_WEIGHT * demand_norm
+    bonus = 0.0
+    if aisle is not None and aisle == "A19" and demand_frequency > 100:
+        bonus = 0.5 * (demand_frequency / 100)
+    return base_reward + bonus
 
 
 def place_new_item(new_item: dict) -> str:
@@ -217,9 +230,9 @@ def _place_new_item_core(new_item: dict, layout_override: Optional[str] = None) 
     if feasible_df.empty:
         return f"No suitable location found for item {new_item['item_id']}"
 
-    # Compute distances & sort for rule-based baseline
+    # Compute priority & sort for rule-based baseline
     feasible_df = _compute_distances(feasible_df)
-    feasible_df.sort_values(by=["distance", "location_id"], inplace=True)
+    feasible_df.sort_values(by=["priority", "location_id"], ascending=[False, False], inplace=True)
 
     # RL training (bandit per state bucket)
     q_table = _load_q_table()
@@ -227,10 +240,16 @@ def _place_new_item_core(new_item: dict, layout_override: Optional[str] = None) 
     shelves = feasible_df["location_id"].tolist()
     max_distance = feasible_df["distance"].max()
 
+    # Optimistic Q-value initialization for A19 shelves
+    for sid in shelves:
+        aisle = sid.split("-")[0] if "-" in sid else ""
+        if aisle == "A19" and (bucket, sid) not in q_table:
+            q_table[(bucket, sid)] = 1.0  # optimistic initial Q-value
     for _ in range(N_EPISODES):
         action_shelf = _epsilon_greedy_select(q_table, bucket, shelves, EPSILON)
         dist = float(feasible_df.loc[feasible_df.location_id == action_shelf, "distance"].iloc[0])
-        r = _reward(dist, max_distance, demand_freq)
+        aisle = action_shelf.split("-")[0] if "-" in action_shelf else ""
+        r = _reward(dist, max_distance, demand_freq, aisle)
         key = (bucket, action_shelf)
         old_q = q_table.get(key, 0.0)
         new_q = (1 - ALPHA) * old_q + ALPHA * r
