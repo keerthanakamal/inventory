@@ -5,7 +5,7 @@ Greedy heuristic to assign high-demand items to most accessible warehouse locati
 ## Input Files
 Place these CSV files in the same directory as `inventory_placement.py` (or provide paths via CLI args):
 
-### item_attributes.csv
+### inventory_data.csv
 Required columns:
 - item_id
 - demand_frequency
@@ -15,7 +15,7 @@ Required columns:
 Optional:
 - weight_per_unit (defaults to 1.0 if missing)
 
-### warehouse_layout.csv
+### locations_data.csv
 Required columns:
 - location_id
 - x_coord
