@@ -325,8 +325,8 @@ def configure_logging(verbose: bool):
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Inventory Placement Optimization (Greedy)")
-    parser.add_argument("--items", default="item_attributes.csv", help="Path to item attributes CSV")
-    parser.add_argument("--layout", default="warehouse_layout.csv", help="Path to warehouse layout CSV")
+    parser.add_argument("--items", default="inventory_data.csv", help="Path to item attributes CSV")
+    parser.add_argument("--layout", default="locations_data.csv", help="Path to warehouse layout CSV")
     parser.add_argument("--output", default="placement_recommendations.csv", help="Output CSV path")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser.parse_args(argv)
